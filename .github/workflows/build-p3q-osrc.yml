@@ -1,0 +1,634 @@
+name: Build p3q from Samsung OSRC source
+
+# 用途：用三星 OSRC 官方源码（与手机固件同源）编译 KernelSU 内核。
+#
+# 与 build-p3q-sukisu.yml 的区别：
+#   1. 源码不来自 git checkout，而是从 Release 资产下载的 OSRC zip
+#      （OSRC 源码包 1~3 GB，GitHub 仓库塞不下，只能走 Release 资产，单文件上限 2 GiB）
+#   2. 不假设 defconfig 名字，自动探测 kernel 树根目录和 p3q defconfig
+#   3. 首次运行建议 inspect_only=yes：只打印结构，不编译，30 秒出结果
+#   4. 默认 bundle_modules=no：源码与固件同源，vermagic 天然一致，只换内核即可
+#
+# 为什么这次能开机：之前那棵社区树是 2025-09 的代码跑 2026-03 的固件，
+# DTB / 早期时钟 / UH 握手 / HDM 全都对不上，所以卡在三星 logo。
+# OSRC 源码就是这台机器固件的同一份内核代码，不存在这个错位。
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset_url:
+        description: '源码包直链（.zip 或 .tar.gz 都行；建议用自己打包的 kernel_p3q_GHZB1_src.tar.gz，约 192 MB）'
+        required: true
+      asset_urls:
+        description: '其余分卷直链（仅当包 > 2 GiB 被拆卷时填，逗号或空格分隔；否则留空）'
+        required: false
+        default: ''
+      defconfig:
+        description: 'defconfig 文件名，留空或填 auto = 自动探测'
+        required: false
+        default: 'vendor/p3q_chn_hkx_defconfig'
+      toolchain:
+        description: '工具链模式：llvm = LLVM=1（本树官方配方，clang+lld）；hybrid = gcc4.9 binutils + clang'
+        required: true
+        default: 'llvm'
+        type: choice
+        options:
+          - llvm
+          - hybrid
+      force_localversion:
+        description: '强制 LOCALVERSION（如 -qgki-31050000）。留空 = 关掉 AUTO，保持 defconfig 里的 -qgki'
+        required: false
+        default: ''
+      ksu_flavor:
+        description: 'KSU 来源'
+        required: true
+        default: 'ksu095'
+        type: choice
+        options:
+          - ksu095
+          - sukisu-v32
+          - sukisu
+      expected_release:
+        description: '原厂 kernel.release，形如 5.4.274-qgki-31050000（adb shell cat /proc/version 里 5.4.274 后面那段）。填了就强制校验'
+        required: false
+        default: ''
+      bundle_modules:
+        description: '是否把自编 .ko 一起刷入 /vendor。OSRC 同源，默认 no（只换内核，保留原厂模块）'
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+      inspect_only:
+        description: '只探测源码结构不编译（第一次跑选 yes，30 秒出结果）'
+        required: true
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+
+jobs:
+  build_osrc:
+    runs-on: ubuntu-latest
+    steps:
+      # ---- 先腾空间：三星源码解压 4~6 GB，out 目录 15 GB+ ----
+      # ubuntu-latest 默认可用空间撑不住，不清理会在链接阶段 ENOSPC
+      - name: Free disk space
+        run: |
+          echo "--- 清理前 ---"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /opt/microsoft 2>/dev/null || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          sudo apt-get clean
+          echo "--- 清理后 ---"
+          df -h /
+          FREE=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "可用空间: ${FREE} GB"
+          [ "$FREE" -ge 25 ] || { echo "::error::只剩 ${FREE} GB，三星源码编译至少需要 25 GB"; exit 1; }
+
+      - name: Download OSRC source
+        run: |
+          set -euo pipefail
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+          # 支持任意多分卷：asset_url 是第 1 卷，asset_urls 里放其余卷
+          # （Release 单资产上限 2 GiB，超过的包会被 fetch workflow 拆开）
+          ALL="$ASSET_URL ${ASSET_EXTRA:-}"
+          IFS=$' \t\n,' read -r -a URLS <<< "$ALL"
+
+          i=0
+          for u in "${URLS[@]}"; do
+            [ -n "$u" ] || continue
+            OUT=$(printf 'part%02d.bin' "$i")
+            echo ">>> [$i] $u"
+            if ! curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
+                        --connect-timeout 30 --max-time 3600 \
+                        -A "$UA" -e "https://opensource.samsung.com/" \
+                        -o "$OUT" "$u"; then
+              echo "::error::第 $((i + 1)) 卷下载失败。检查链接是否带错、或 Release 资产是否已被删除"
+              exit 1
+            fi
+            ls -lh "$OUT"
+            i=$((i + 1))
+          done
+
+          [ "$i" -gt 0 ] || { echo "::error::没有解析到任何下载链接"; exit 1; }
+
+          if [ "$i" -eq 1 ]; then
+            mv part00.bin src.pkg
+          else
+            echo "合并 $i 个分卷"
+            cat $(ls part*.bin | sort) > src.pkg
+            rm -f part*.bin
+          fi
+          ls -lh src.pkg
+          echo "下载完成: $(stat -c%s src.pkg) bytes"
+
+          # 校验格式：既支持 .zip，也支持 .tar.gz（自己打的源码包走这条）
+          MAGIC=$(head -c 2 src.pkg)
+          HEX=$(head -c 2 src.pkg | od -An -tx1 | tr -d ' \n')
+          if [ "$MAGIC" = "PK" ]; then
+            SRC_TYPE=zip
+            unzip -l src.pkg > /dev/null || { echo "::error::zip 中央目录读不出来，下载被截断"; exit 1; }
+            echo "格式: zip，结构校验通过"
+          elif [ "$HEX" = "1f8b" ]; then
+            SRC_TYPE=targz
+            gzip -t src.pkg || { echo "::error::gzip 校验失败，下载被截断"; exit 1; }
+            echo "格式: tar.gz，gzip 校验通过"
+          else
+            echo "::error::既不是 zip 也不是 tar.gz（前 2 字节 = ${HEX:-空}）"
+            echo "---- 内容开头 400 字节 ----"
+            head -c 400 src.pkg || true
+            echo ""
+            echo "常见原因：链接填错、Release 资产被删、或下到的是登录页/错误页"
+            exit 1
+          fi
+          echo "SRC_TYPE=$SRC_TYPE" >> "$GITHUB_ENV"
+          echo "ASSET_SIZE=$(stat -c%s src.pkg)" >> "$GITHUB_ENV"
+        env:
+          ASSET_URL: ${{ inputs.asset_url }}
+          ASSET_EXTRA: ${{ inputs.asset_urls }}
+
+      # ---- 解压 + 探测：把 kernel 树根目录和 defconfig 自动找出来 ----
+      - name: Extract and inspect
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          echo "===== 解压中（源包 $(numfmt --to=iec ${ASSET_SIZE:-0})，约 1~3 分钟）====="
+          case "${SRC_TYPE:-zip}" in
+            zip)   unzip -q -o src.pkg -d src ;;
+            targz) tar -xzf src.pkg -C src ;;
+            *)     echo "::error::未知的源包格式 ${SRC_TYPE}"; exit 1 ;;
+          esac
+          rm -f src.pkg
+          echo "解压完成，文件数: $(find src -type f | wc -l)"
+
+          # 三星的包有时是 zip 里再套一层 tar.gz，先统一展开（只挑 5 MB 以上的，避免误伤树里的零碎文件）
+          NESTED=$(find src -maxdepth 3 -type f -size +5M \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar' \) | head -5)
+          if [ -n "$NESTED" ]; then
+            echo "发现嵌套压缩包，继续解压:"
+            echo "$NESTED"
+            for t in $NESTED; do
+              case "$t" in
+                *.tar.gz|*.tgz) tar -xzf "$t" -C "$(dirname "$t")" && rm -f "$t";;
+                *.tar)          tar -xf  "$t" -C "$(dirname "$t")" && rm -f "$t";;
+              esac
+            done
+          fi
+          df -h / | tail -1
+
+          echo ""
+          echo "===== 顶层目录（2 层以内）====="
+          find src -maxdepth 2 -type d | sort | head -40
+
+          echo ""
+          echo "===== 候选内核树（VERSION=5 PATCHLEVEL=4 且含 arch/arm64）====="
+          KROOT=""
+          while IFS= read -r mk; do
+            d=$(dirname "$mk")
+            v=$(sed -n 's/^VERSION = //p' "$mk" | head -1)
+            p=$(sed -n 's/^PATCHLEVEL = //p' "$mk" | head -1)
+            s=$(sed -n 's/^SUBLEVEL = //p' "$mk" | head -1)
+            hasarch="no"
+            [ -d "$d/arch/arm64" ] && hasarch="yes"
+            echo "  $d  ->  ${v}.${p}.${s}  arch/arm64: ${hasarch}"
+            if [ "$v" = "5" ] && [ "$p" = "4" ] && [ "$hasarch" = "yes" ] && [ -z "$KROOT" ]; then
+              KROOT="$d"
+            fi
+          done < <(find src -maxdepth 5 -name Makefile -type f)
+          [ -n "$KROOT" ] || { echo "::error::找不到 5.4 内核树，把上面的目录列表发给我"; exit 1; }
+          KROOT="$(cd "$KROOT" && pwd)"
+          echo "选定内核树: $KROOT"
+
+          echo ""
+          echo "===== p3q 相关 defconfig ====="
+          ls -1 "$KROOT"/arch/arm64/configs/*p3q*defconfig 2>/dev/null || true
+          ls -1 "$KROOT"/arch/arm64/configs/vendor/*p3q*defconfig 2>/dev/null || true
+          echo ""
+          echo "===== arch/arm64/configs 全部内容 ====="
+          ls -1 "$KROOT"/arch/arm64/configs/ 2>/dev/null | head -30
+          echo "--- vendor/ ---"
+          ls -1 "$KROOT"/arch/arm64/configs/vendor/ 2>/dev/null | head -30
+
+          echo ""
+          echo "===== 构建脚本 / build.config（判断三星用什么方式编译）====="
+          ls -1 "$KROOT"/build.config* 2>/dev/null || echo "  无 build.config*"
+          ls -1 "$KROOT"/build_kernel*.sh "$KROOT"/build*.sh 2>/dev/null || echo "  无 build*.sh"
+          [ -d "$KROOT/build" ] && ls -1 "$KROOT/build" | head -10 || true
+
+          echo ""
+          echo "===== Makefile 头部 ====="
+          sed -n '1,6p' "$KROOT/Makefile"
+
+          echo ""
+          echo "===== KSU 硬依赖在 defconfig 里的情况 ====="
+          for f in "$KROOT"/arch/arm64/configs/*p3q*defconfig "$KROOT"/arch/arm64/configs/vendor/*p3q*defconfig; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            grep -nE "^(CONFIG_(KPROBES|KRETPROBES|EXT4_FS|KALLSYMS|KALLSYMS_ALL|OVERLAY_FS|MODULE_SIG|MODVERSIONS|LOCALVERSION|LOCALVERSION_AUTO|LTO_CLANG|LTO)|# CONFIG_(MODULE_SIG|LOCALVERSION_AUTO|LTO_CLANG))" "$f" | head -20
+          done
+
+          echo "KROOT=$KROOT" >> "$GITHUB_ENV"
+
+      - name: Resolve defconfig
+        run: |
+          set -euo pipefail
+          CAND=""
+          for f in "$KROOT"/arch/arm64/configs/*p3q*defconfig "$KROOT"/arch/arm64/configs/vendor/*p3q*defconfig; do
+            [ -f "$f" ] || continue
+            CAND="$CAND $f"
+          done
+          echo "候选:$CAND"
+          [ -n "$CAND" ] || { echo "::error::找不到任何 p3q defconfig"; exit 1; }
+
+          if [ "$WANT" = "auto" ] || [ -z "$WANT" ]; then
+            # 优先取名字最短的（通常是 p3q_defconfig 或 p3q_chn_hkx_defconfig 这类主配置）
+            DEF=$(for f in $CAND; do echo "$(basename "$f" | wc -c) $f"; done | sort -n | head -1 | awk '{print $2}')
+            echo "::warning::自动选中 $(basename "$DEF")，如果不对请在 defconfig 输入框里填准确名字"
+          else
+            DEF=""
+            for f in $CAND; do
+              [ "$(basename "$f")" = "$WANT" ] && DEF="$f"
+            done
+            [ -n "$DEF" ] || { echo "::error::指定的 defconfig $WANT 不存在，候选见上"; exit 1; }
+          fi
+          echo "使用 defconfig: $DEF"
+          # make 的 defconfig 目标名是相对于 arch/arm64/configs 的路径，
+          # 放在 vendor/ 子目录时必须写成 vendor/xxx_defconfig，否则找不到
+          CFG_ROOT="$KROOT/arch/arm64/configs"
+          DEFTARGET="${DEF#$CFG_ROOT/}"
+          echo "make 目标: $DEFTARGET"
+          echo "DEFCONFIG=$DEF" >> "$GITHUB_ENV"
+          echo "DEFCONFIG_TARGET=$DEFTARGET" >> "$GITHUB_ENV"
+        env:
+          WANT: ${{ inputs.defconfig }}
+
+      - name: Set up build environment
+        run: |
+          set -euo pipefail
+          sudo apt update
+          DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+            attr bc bison build-essential ccache device-tree-compiler flex \
+            git libelf-dev libssl-dev lld lz4 python3 rsync unzip wget zip \
+            gcc-aarch64-linux-gnu
+          DEBIAN_FRONTEND=noninteractive sudo apt install -yq "linux-modules-extra-$(uname -r)" \
+            || echo "::warning::linux-modules-extra 不可用，已跳过（与内核编译无关）"
+          sudo ln -sf /usr/bin/python3 /usr/bin/python || true
+          for c in make bc bison flex zip unzip lz4 git python3; do
+            command -v "$c" > /dev/null || { echo "::error::缺少 $c"; exit 1; }
+          done
+          echo "工具就绪"
+
+      # ---- 工具链按三星 OSRC 官方配方，不是纯 LLVM=1 ----
+      # 依据：OSRC 树自带的 how_to_build.md（社区整理版）明确要求
+      #   gcc aarch64-linux-android-4.9  +  clang-r383902b
+      #   CLANG_TRIPLE=aarch64-linux-gnu-  CROSS_COMPILE=aarch64-linux-android-
+      # 用新 clang（19/20）编这种 2021 年的老树，会撞上一堆
+      # -Wenum-conversion / -Wimplicit-function-declaration 变成 error 的问题。
+      - name: Fetch toolchains
+        if: inputs.inspect_only == 'no'
+        run: |
+          set -euo pipefail
+          BASE="https://android.googlesource.com/platform/prebuilts"
+          WS="$(pwd)"
+
+          # 1) GCC 4.9 aarch64-linux-android（提供 binutils + CROSS_COMPILE 前缀）
+          rm -rf gcc64 && mkdir -p gcc64
+          GOK=0
+          for u in "$BASE/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android12-release.tar.gz" \
+                   "$BASE/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/master.tar.gz"; do
+            echo "gcc: $u"
+            if wget -q --timeout=180 --tries=2 "$u" -O gcc.tgz && tar -xzf gcc.tgz -C gcc64; then
+              if [ -d gcc64/bin ] && ls gcc64/bin/aarch64-linux-android-* > /dev/null 2>&1; then GOK=1; break; fi
+            fi
+          done
+          rm -f gcc.tgz
+          [ "$GOK" = "1" ] || { echo "::error::gcc-4.9 下载失败"; exit 1; }
+          echo "gcc 就绪: $(ls gcc64/bin/ | grep -m1 'aarch64-linux-android-gcc')"
+
+          # 2) clang：优先 r383902b（三星官方配方），失败回退到较新的 AOSP 版本
+          rm -rf clang && mkdir -p clang
+          COK=0
+          for u in "$BASE/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902b.tar.gz" \
+                   "$BASE/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz" \
+                   "https://github.com/userariii/AOSP-clang/releases/download/clang-r530567/clang-r530567.tar.gz"; do
+            echo "clang: $u"
+            if wget -q --timeout=240 --tries=2 "$u" -O clang.tgz && tar -xzf clang.tgz -C clang && [ -x clang/bin/clang ]; then
+              COK=1; break
+            fi
+          done
+          rm -f clang.tgz
+          [ "$COK" = "1" ] || { echo "::error::clang 下载失败"; exit 1; }
+          CV=$(./clang/bin/clang --version | head -1)
+          echo "clang: $CV"
+          case "$CV" in
+            *"version 11."*|*"version 12."*) : ;;
+            *) echo "::warning::clang 版本不是 11/12——三星配方是 r383902b，用新版可能在老树上编不过" ;;
+          esac
+
+          echo "TC_PATH=${WS}/gcc64/bin:${WS}/clang/bin" >> "$GITHUB_ENV"
+
+      # ---- 组装 make 参数：DTC_EXT 只在树里真的带了 tools/dtc 时才加 ----
+      - name: Compose make args
+        if: inputs.inspect_only == 'no'
+        run: |
+          set -euo pipefail
+          if [ "${TOOLCHAIN}" = "llvm" ]; then
+            # 本树 Makefile 里有 ifneq ($(LLVM),) 分支：
+            #   REAL_CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy ...
+            # 且 defconfig 记录的是 CONFIG_CC_IS_CLANG=y / CONFIG_LD_IS_LLD=y /
+            # "Android (6877366 based on r383902b1) clang version 11.0.2"
+            # → 三星官方就是 LLVM=1 建的，这是最贴合原厂的选择
+            ARGS="ARCH=arm64 LLVM=1 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CONFIG_BUILD_ARM64_DT_OVERLAY=y"
+            for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+              export PATH="$TC_PATH:$PATH"
+              command -v "$t" > /dev/null || { echo "::error::LLVM=1 需要 $t，工具链里没有"; exit 1; }
+            done
+            echo "LLVM=1 所需工具齐全: clang / ld.lld / llvm-*"
+          else
+            ARGS="ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CONFIG_BUILD_ARM64_DT_OVERLAY=y"
+            echo "hybrid 模式：CC=clang，LD/AR 走 gcc-4.9 binutils"
+          fi
+          if [ -x "$KROOT/tools/dtc/dtc" ] || [ -d "$KROOT/tools/dtc" ]; then
+            ARGS="DTC_EXT=$KROOT/tools/dtc $ARGS"
+            echo "使用树内 dtc: $KROOT/tools/dtc"
+          else
+            echo "::warning::树里没有 tools/dtc，改用系统 device-tree-compiler"
+          fi
+          echo "MK_ARGS=$ARGS" >> "$GITHUB_ENV"
+          echo "make 参数: $ARGS"
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+
+      - name: Fetch AnyKernel3
+        if: inputs.inspect_only == 'no'
+        run: git clone --depth 1 https://github.com/LucasBlackLu/AnyKernel3 -b samsung ./AnyKernel3
+
+      # ---- 只追加 KSU 相关项，其余 CONFIG 一律不动 ----
+      # OSRC 源码与固件同源，任何额外改动都会让内核偏离出厂行为，
+      # 这是"卡 logo"之外最容易自己制造的问题。
+      - name: Add KSU config only
+        if: inputs.inspect_only == 'no'
+        run: |
+          set -euo pipefail
+          D="$DEFCONFIG"
+          cp "$D" "$D.orig"
+          for k in CONFIG_KSU CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_EXT4_FS \
+                   CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL CONFIG_OVERLAY_FS; do
+            if grep -qx "${k}=y" "$D"; then
+              echo "present ${k}"
+            else
+              echo "${k}=y" >> "$D"
+              echo "added   ${k}"
+            fi
+          done
+          echo "===== 与原厂的差异（应只有上面几行）====="
+          diff "$D.orig" "$D" || true
+          rm -f "$D.orig"
+
+      - name: Integrate KSU
+        if: inputs.inspect_only == 'no'
+        run: |
+          set -euo pipefail
+          cd "$KROOT"
+          case "$FLAVOR" in
+            sukisu)     REPO="https://github.com/SukiSU-Ultra/SukiSU-Ultra"; REF="main";;
+            sukisu-v32) REPO="https://github.com/SukiSU-Ultra/SukiSU-Ultra"; REF="v3.2.0";;
+            *)          REPO="https://github.com/tiann/KernelSU";            REF="v0.9.5";;
+          esac
+          echo "集成 $REPO @ $REF"
+          rm -rf KernelSU drivers/kernelsu
+          git clone --depth 1 -b "$REF" "$REPO" KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          grep -q 'CONFIG_KSU) += kernelsu' drivers/Makefile \
+            || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig \
+            || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
+          ls -l drivers/kernelsu
+          grep -n kernelsu drivers/Makefile drivers/Kconfig
+          git -C KernelSU rev-parse --short HEAD
+        env:
+          FLAVOR: ${{ inputs.ksu_flavor }}
+
+      - name: Apply 5.4 compat patches
+        if: inputs.inspect_only == 'no' && inputs.ksu_flavor != 'ksu095'
+        run: |
+          set -euo pipefail
+          cd "$KROOT/KernelSU/kernel"
+          HIT=$(grep -rl "struct proc_ops" . || true)
+          if [ -z "$HIT" ]; then
+            echo "未发现 proc_ops 用法，跳过"
+          else
+            echo "$HIT"
+            for f in $HIT; do
+              sed -i 's/struct proc_ops/struct file_operations/g' "$f"
+              sed -i -E 's/\.proc_(open|read|write|lseek|release|poll|ioctl|compat_ioctl|mmap|read_iter|write_iter)\b/.\1/g' "$f"
+              echo "  patched: $f"
+            done
+          fi
+          if grep -rn "proc_open\|proc_read\|proc_write\|proc_lseek\|proc_release" .; then
+            echo "::error::仍有 proc_* 成员未替换"; exit 1
+          fi
+          echo "已无 proc_* 成员"
+
+      - name: Preflight config check
+        if: inputs.inspect_only == 'no'
+        run: |
+          set -euo pipefail
+          export PATH="$TC_PATH:$PATH"
+          cd "$KROOT"
+          make -j"$(nproc --all)" O=out $MK_ARGS "$DEFCONFIG_TARGET" > /dev/null
+          for k in CONFIG_KSU CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_EXT4_FS; do
+            grep -qx "${k}=y" out/.config || { echo "::error::${k} 未生效，停止编译"; exit 1; }
+            echo "OK ${k}=y"
+          done
+          echo "--- LTO / MODVERSIONS / LOCALVERSION（仅提示）---"
+          grep -E "^CONFIG_(LTO|MODVERSIONS|LOCALVERSION)" out/.config || true
+          grep -E "MODULE_SIG" out/.config || true
+          echo "--- 编译前 kernel.release ---"
+          cat out/include/config/kernel.release 2>/dev/null || echo "(defconfig 阶段还没有)"
+          rm -rf out
+
+      - name: Build kernel
+        if: inputs.inspect_only == 'no'
+        run: |
+          set -euo pipefail
+          export PATH="$TC_PATH:$PATH"
+          cd "$KROOT"
+          J="$(nproc --all)"
+          M="make -j${J} O=$(pwd)/out $MK_ARGS"
+          : > "$GITHUB_WORKSPACE/build.log"
+          {
+            echo "===== [1/3] defconfig ====="
+            $M "$DEFCONFIG_TARGET"
+            echo "===== [1.5/3] LOCALVERSION ====="
+            # defconfig 里是 CONFIG_LOCALVERSION="-qgki" + LOCALVERSION_AUTO=y。
+            # AUTO 在树里有 .git 时会追加 -g<hash>-dirty，得到 -qgki-gabab53f4-dirty；
+            # 原厂是 5.4.274-qgki-31050000。两者对不上，/vendor 里的 .ko 全部拒绝加载。
+            # 这里默认只关掉 AUTO（结果 = -qgki，可复现），需要完全对齐时用 force_localversion 指定。
+            sh ./scripts/config --file out/.config --disable LOCALVERSION_AUTO
+            if [ -n "${FORCE_LOCALVERSION:-}" ]; then
+              sh ./scripts/config --file out/.config --set-str LOCALVERSION "$FORCE_LOCALVERSION"
+              echo "强制 LOCALVERSION=$FORCE_LOCALVERSION"
+            fi
+            $M olddefconfig
+            grep -E "^CONFIG_LOCALVERSION|LOCALVERSION_AUTO" out/.config || true
+            echo "===== [2/3] all（Image + dtb + dtbo.img）====="
+            $M
+            if [ "$BUNDLE_MODULES" = "yes" ]; then
+              echo "===== [3/3] modules + modules_install ====="
+              $M modules
+              $M INSTALL_MOD_PATH=modules INSTALL_MOD_STRIP=1 modules_install
+            else
+              echo "===== [3/3] 跳过 modules（bundle_modules=no，只换内核，省 20 分钟）====="
+            fi
+          } 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+
+          echo "===== 产物 ====="
+          ls -lh out/arch/arm64/boot/ | head -20
+
+          IMG=out/arch/arm64/boot/Image
+          if [ ! -f "$IMG" ] && [ -f out/arch/arm64/boot/Image.gz ]; then
+            echo "只生成了 Image.gz，解压成 Image"
+            gunzip -c out/arch/arm64/boot/Image.gz > "$IMG"
+          fi
+          [ -f "$IMG" ] || { echo "::error::Image 未生成"; exit 1; }
+          ISZ=$(stat -c%s "$IMG")
+          echo "Image: ${ISZ} bytes"
+          [ "$ISZ" -gt 20000000 ] || { echo "::error::Image 只有 $((ISZ/1048576)) MiB，链接不完整"; exit 1; }
+
+          echo "===== vermagic ====="
+          REL=$(cat out/include/config/kernel.release 2>/dev/null || echo "?")
+          echo "kernel.release = ${REL}"
+          case "$REL" in
+            *-dirty*|*-g[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+              echo "::warning::kernel.release 带 git 后缀，与原厂不一致，此时必须 bundle_modules=yes"
+              echo "HAS_GIT_SUFFIX=1" >> "$GITHUB_ENV";;
+          esac
+          if [ -n "${EXPECTED_REL:-}" ]; then
+            if [ "$REL" != "$EXPECTED_REL" ]; then
+              echo "::error::vermagic 不符：实际 ${REL} ≠ 期望 ${EXPECTED_REL}"
+              exit 1
+            fi
+            echo "vermagic 与期望值完全一致"
+          fi
+        env:
+          EXPECTED_REL: ${{ inputs.expected_release }}
+          BUNDLE_MODULES: ${{ inputs.bundle_modules }}
+          FORCE_LOCALVERSION: ${{ inputs.force_localversion }}
+
+      - name: Package AnyKernel3 zip
+        if: inputs.inspect_only == 'no'
+        run: |
+          set -euo pipefail
+          SRC="$KROOT"
+          IMG="$SRC/out/arch/arm64/boot/Image"
+          DTBO="$SRC/out/arch/arm64/boot/dtbo.img"
+          BUNDLE="$BUNDLE_MODULES"
+
+          cd AnyKernel3
+          git reset --hard > /dev/null 2>&1 || true
+          rm -rf modules Lavender*.zip
+          cp "$IMG" .
+          if [ -f "$DTBO" ]; then
+            cp "$DTBO" .
+            echo "已附 dtbo.img（仅存档，anykernel.sh 不会刷它）"
+          else
+            echo "无 dtbo.img，跳过"
+          fi
+
+          if [ "$BUNDLE" = "yes" ]; then
+            KO_SRC=""
+            for d in "$SRC/out/modules" "$SRC/modules"; do
+              if [ -d "$d" ] && [ "$(find "$d" -name '*.ko' 2>/dev/null | wc -l)" -gt 0 ]; then
+                KO_SRC="$d"; break
+              fi
+            done
+            [ -n "$KO_SRC" ] || { echo "::error::找不到任何 .ko"; exit 1; }
+            KO=$(find "$KO_SRC" -name '*.ko' | wc -l)
+            echo "modules: $KO_SRC，$KO 个 .ko"
+            [ "$KO" -gt 20 ] || { echo "::error::.ko 只有 $KO 个"; exit 1; }
+            mkdir -p modules/vendor/lib/modules
+            find "$KO_SRC" -name '*.ko' -exec cp {} modules/vendor/lib/modules/ \;
+          else
+            sed -i 's/^do\.modules=1/do.modules=0/' anykernel.sh
+            grep -n "^do.modules=" anykernel.sh
+            echo "只换内核：手机上的原厂 /vendor/lib/modules 保持不动"
+          fi
+
+          ZIP="OSRC_KSU_p3q_SM-G9980_$(date +%d%m%y-%H%M)$( [ "$BUNDLE" = "no" ] && echo "_nomod" ).zip"
+          zip -r9 "$ZIP" . -x '*.git*' '*patch*' '*ramdisk*' 'LICENSE' 'README.md' > /dev/null
+          SIZE=$(stat -c%s "$ZIP")
+          echo "zip: $ZIP  ${SIZE} bytes  ($((SIZE/1048576)) MiB)"
+          ls -lh "$ZIP"
+          if [ "$BUNDLE" = "yes" ]; then
+            [ "$SIZE" -gt 15000000 ] || { echo "::error::包只有 $((SIZE/1048576)) MiB，内核或模块缺失"; exit 1; }
+          else
+            [ "$SIZE" -gt 5000000 ] || { echo "::error::包只有 $((SIZE/1048576)) MiB，内核没打进去"; exit 1; }
+          fi
+        env:
+          BUNDLE_MODULES: ${{ inputs.bundle_modules }}
+
+      - name: Collect build errors
+        if: failure()
+        run: |
+          L="$GITHUB_WORKSPACE/build.log"
+          [ -f "$L" ] || { echo "没有 build.log（失败发生在编译之前，看上面步骤）"; exit 0; }
+          echo "############ 失败发生在哪个阶段 ############"
+          grep -n "===== \[" "$L" | tail -3 || true
+          echo ""
+          echo "############ 编译错误 ############"
+          grep -nE "(error|fatal error):" "$L" | head -40 || echo "未匹配到 error:"
+          echo ""
+          echo "############ 缺失符号 / 隐式声明 ############"
+          grep -nE "implicit declaration|undeclared|undefined reference|No such file or directory" "$L" | head -25 || true
+          echo ""
+          echo "############ 失败目标 ############"
+          grep -nE "Error [0-9]+$" "$L" | head -20 || true
+          echo ""
+          echo "############ 最后 120 行 ############"
+          tail -120 "$L"
+          exit 0
+
+      - name: Verify artifacts
+        if: inputs.inspect_only == 'no' && success()
+        run: |
+          set -euo pipefail
+          Z=$(ls AnyKernel3/*.zip | head -1)
+          echo "zip: $Z  $(stat -c%s "$Z") bytes"
+          unzip -l "$Z" > zl.txt
+          grep -qE ' Image$' zl.txt || { echo "::error::zip 里没有 Image"; exit 1; }
+          grep -q  'anykernel.sh' zl.txt || { echo "::error::不是有效卡刷包"; exit 1; }
+          ZKO=$(grep -c '\.ko$' zl.txt || true)
+          echo "zip 内 .ko 数量: $ZKO"
+          if [ "$BUNDLE_MODULES" = "yes" ]; then
+            [ "$ZKO" -gt 20 ] || { echo "::error::.ko 只有 $ZKO 个"; exit 1; }
+          else
+            [ "$ZKO" -eq 0 ] || { echo "::error::nomod 模式但包里仍有 .ko"; exit 1; }
+          fi
+          head -12 zl.txt
+          rm -f zl.txt
+        env:
+          BUNDLE_MODULES: ${{ inputs.bundle_modules }}
+
+      - name: Upload build log
+        if: always() && inputs.inspect_only == 'no'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_id }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload artifact
+        if: inputs.inspect_only == 'no' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OSRC-KSU-p3q-${{ inputs.ksu_flavor }}-${{ github.run_id }}
+          path: AnyKernel3/*.zip
+          if-no-files-found: error
+          retention-days: 14
