@@ -245,22 +245,32 @@ jobs:
           echo "候选:$CAND"
           [ -n "$CAND" ] || { echo "::error::找不到任何 p3q defconfig"; exit 1; }
 
+          # make 的 defconfig 目标名是相对于 arch/arm64/configs 的路径，
+          # 放在 vendor/ 子目录时必须写成 vendor/xxx_defconfig，否则找不到
+          CFG_ROOT="$KROOT/arch/arm64/configs"
+
           if [ "$WANT" = "auto" ] || [ -z "$WANT" ]; then
             # 优先取名字最短的（通常是 p3q_defconfig 或 p3q_chn_hkx_defconfig 这类主配置）
             DEF=$(for f in $CAND; do echo "$(basename "$f" | wc -c) $f"; done | sort -n | head -1 | awk '{print $2}')
             echo "::warning::自动选中 $(basename "$DEF")，如果不对请在 defconfig 输入框里填准确名字"
           else
+            # 三种写法都接受：vendor/xxx_defconfig（相对 configs 根）、xxx_defconfig（裸文件名）、绝对路径
             DEF=""
             for f in $CAND; do
-              [ "$(basename "$f")" = "$WANT" ] && DEF="$f"
+              rel="${f#"$CFG_ROOT"/}"
+              if [ "$rel" = "$WANT" ] || [ "$(basename "$f")" = "$WANT" ] || [ "$f" = "$WANT" ]; then
+                DEF="$f"
+              fi
             done
-            [ -n "$DEF" ] || { echo "::error::指定的 defconfig $WANT 不存在，候选见上"; exit 1; }
+            if [ -z "$DEF" ]; then
+              echo "::error::指定的 defconfig '$WANT' 不存在"
+              echo "---- 可用候选（相对 configs 根目录的写法）----"
+              for f in $CAND; do echo "  ${f#"$CFG_ROOT"/}"; done
+              exit 1
+            fi
           fi
           echo "使用 defconfig: $DEF"
-          # make 的 defconfig 目标名是相对于 arch/arm64/configs 的路径，
-          # 放在 vendor/ 子目录时必须写成 vendor/xxx_defconfig，否则找不到
-          CFG_ROOT="$KROOT/arch/arm64/configs"
-          DEFTARGET="${DEF#$CFG_ROOT/}"
+          DEFTARGET="${DEF#"$CFG_ROOT"/}"
           echo "make 目标: $DEFTARGET"
           echo "DEFCONFIG=$DEF" >> "$GITHUB_ENV"
           echo "DEFCONFIG_TARGET=$DEFTARGET" >> "$GITHUB_ENV"
