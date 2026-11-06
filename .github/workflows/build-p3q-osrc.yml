@@ -17,10 +17,11 @@ on:
   workflow_dispatch:
     inputs:
       asset_url:
-        description: '源码包直链（.zip 或 .tar.gz 都行；建议用自己打包的 kernel_p3q_GHZB1_src.tar.gz，约 192 MB）'
+        description: '源码包直链（.zip 或 .tar.gz 都行）。默认已填好本次用的 kernel_p3q_GHZB1_src.tar.gz'
         required: true
+        default: 'https://github.com/1986328392/kernel_samsung_sm8350/releases/download/src-GHZB1/kernel_p3q_GHZB1_src.tar.gz'
       asset_urls:
-        description: '其余分卷直链（仅当包 > 2 GiB 被拆卷时填，逗号或空格分隔；否则留空）'
+        description: '【单卷包请留空】只填其余分卷的直链（>2 GiB 被拆卷时才用），逗号或空格分隔。不要填 yes/no'
         required: false
         default: ''
       defconfig:
@@ -36,9 +37,9 @@ on:
           - llvm
           - hybrid
       force_localversion:
-        description: '强制 CONFIG_LOCALVERSION 完整值，形如 -qgki-30957850-abG9980ZHSGHZB1（取自 adb shell uname -r 去掉 5.4.274）。漏写 -qgki 会自动补上'
+        description: '强制 CONFIG_LOCALVERSION 完整值，形如 -qgki-30957850-abG9980ZHSGHZB1（= adb shell uname -r 去掉 5.4.274）。漏写 -qgki 会自动补'
         required: false
-        default: ''
+        default: '-qgki-30957850-abG9980ZHSGHZB1'
       ksu_flavor:
         description: 'KSU 来源'
         required: true
@@ -49,9 +50,9 @@ on:
           - sukisu-v32
           - sukisu
       expected_release:
-        description: '原厂 kernel.release 完整值，形如 5.4.274-qgki-30957850-abG9980ZHSGHZB1（= adb shell uname -r 的输出）。填了就强制校验'
+        description: '原厂 kernel.release 完整值（= adb shell uname -r 的输出），填了就强制校验 vermagic'
         required: false
-        default: ''
+        default: '5.4.274-qgki-30957850-abG9980ZHSGHZB1'
       bundle_modules:
         description: '是否把自编 .ko 一起刷入 /vendor。OSRC 同源，默认 no（只换内核，保留原厂模块）'
         required: true
@@ -61,13 +62,13 @@ on:
           - 'no'
           - 'yes'
       inspect_only:
-        description: '只探测源码结构不编译（第一次跑选 yes，30 秒出结果）'
+        description: '要出卡刷包必须选 no。选 yes 只探测源码结构：不编译、不产 AnyKernel3 包、Artifacts 为空'
         required: true
-        default: 'yes'
+        default: 'no'
         type: choice
         options:
-          - 'yes'
           - 'no'
+          - 'yes'
 
 jobs:
   build_osrc:
@@ -97,12 +98,29 @@ jobs:
 
           # 支持任意多分卷：asset_url 是第 1 卷，asset_urls 里放其余卷
           # （Release 单资产上限 2 GiB，超过的包会被 fetch workflow 拆开）
-          ALL="$ASSET_URL ${ASSET_EXTRA:-}"
-          IFS=$' \t\n,' read -r -a URLS <<< "$ALL"
+          ALL="${ASSET_URL:-} ${ASSET_EXTRA:-}"
+          IFS=$' \t\n,' read -r -a RAW <<< "$ALL"
+
+          # 只接受 http(s) 开头的项。
+          # 原写法会把用户在 asset_urls 里误填的开关值（yes/no）当成第 2 卷 URL，
+          # 报 "curl: (6) Could not resolve host: no"，很难看出是这个框填错了。
+          URLS=()
+          for u in "${RAW[@]}"; do
+            [ -n "$u" ] || continue
+            case "$u" in
+              http://*|https://*) URLS+=("$u") ;;
+              *) echo "::warning::忽略非 URL 输入: '$u' —— asset_urls 只填分卷直链，没有分卷就留空（不要填 yes/no）" ;;
+            esac
+          done
+          [ "${#URLS[@]}" -gt 0 ] || {
+            echo "::error::没有解析到任何有效 URL（asset_url 必须以 http:// 或 https:// 开头）"
+            echo "实际收到: '$ALL'"
+            exit 1
+          }
+          echo "待下载卷数: ${#URLS[@]}"
 
           i=0
           for u in "${URLS[@]}"; do
-            [ -n "$u" ] || continue
             OUT=$(printf 'part%02d.bin' "$i")
             echo ">>> [$i] $u"
             if ! curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
@@ -299,6 +317,7 @@ jobs:
           echo "::notice title=Inspect only::本次只做探测，未编译，不会产生 AnyKernel3 包。把 inspect_only 改为 no 重新运行。"
 
       - name: Set up build environment
+        if: inputs.inspect_only == 'no'
         run: |
           set -euo pipefail
           sudo apt update
