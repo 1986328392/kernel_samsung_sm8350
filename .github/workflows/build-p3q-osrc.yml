@@ -515,6 +515,37 @@ jobs:
           {
             echo "===== [1/3] defconfig ====="
             $M "$DEFCONFIG_TARGET"
+
+            echo "===== [1.2/3] 补齐 OSRC 缺失的源码 ====="
+            # 三星用 Windows 打包 OSRC，NTFS 不区分大小写，同一目录下仅大小写不同的
+            # 文件对会被折叠成一个（net/netfilter 下 xt_DSCP.c 与 xt_dscp.c 等），
+            # 但 Makefile 两个名字都引用，于是报
+            #   "No rule to make target 'net/netfilter/xt_DSCP.o'"
+            # 注意不能用小写文件改名顶上：大写的是 iptables target，小写的是 match，
+            # 两套 struct 完全不同，改名词会编译不过。
+            # 从与源码同版本的 v5.4.274 稳定分支补回；下载失败则关掉对应 CONFIG 兜底。
+            OSRC_REF="https://raw.githubusercontent.com/gregkh/linux/v5.4.274/net/netfilter"
+            for f in xt_DSCP.c xt_TCPMSS.c xt_HL.c xt_RATEEST.c; do
+              [ -f "net/netfilter/$f" ] && { echo "已存在 net/netfilter/$f"; continue; }
+              if wget -q --timeout=60 --tries=3 "$OSRC_REF/$f" -O "net/netfilter/$f" \
+                 && [ -s "net/netfilter/$f" ] \
+                 && grep -q "MODULE_LICENSE" "net/netfilter/$f"; then
+                echo "已补齐 net/netfilter/$f（$(stat -c%s "net/netfilter/$f") bytes）"
+              else
+                rm -f "net/netfilter/$f"
+                case "$f" in
+                  xt_DSCP.c)    C=NETFILTER_XT_TARGET_DSCP ;;
+                  xt_TCPMSS.c)  C=NETFILTER_XT_TARGET_TCPMSS ;;
+                  xt_HL.c)      C=NETFILTER_XT_TARGET_HL ;;
+                  xt_RATEEST.c) C=NETFILTER_XT_TARGET_RATEEST ;;
+                esac
+                echo "::warning::补 $f 失败，关闭 CONFIG_${C} 兜底（该 iptables target 将不可用）"
+                bash ./scripts/config --file out/.config --disable "$C"
+              fi
+            done
+            echo "net/netfilter 现有 dscp/tcp 文件:"
+            ls -1 net/netfilter/ | grep -iE "dscp|tcpmss" || true
+
             echo "===== [1.5/3] LOCALVERSION ====="
             # 原厂 vermagic = 5.4.274-qgki-30957850-abG9980ZHSGHZB1
             #   -qgki 这一段来自 defconfig 的 CONFIG_LOCALVERSION
@@ -657,6 +688,22 @@ jobs:
           echo ""
           echo "############ 失败目标 ############"
           grep -nE "Error [0-9]+$" "$L" | head -20 || true
+          echo ""
+          echo "############ 首次失败点上下文 ############"
+          # 三星树里很多失败不带 "error:" 字样（私有头文件缺失、子目录 Error 1、
+          # dtbo 构建脚本失败等），只 grep error: 会得到空段，必须回看上下文
+          FIRST_ERR=$(grep -nE "(error|fatal error):" "$L" | head -1 | cut -d: -f1 || true)
+          if [ -z "${FIRST_ERR:-}" ]; then
+            FIRST_ERR=$(grep -nE "\*\*\* \[.*\] Error [0-9]+" "$L" | head -1 | cut -d: -f1 || true)
+          fi
+          if [ -n "${FIRST_ERR:-}" ]; then
+            S=$((FIRST_ERR - 150)); [ "$S" -lt 1 ] && S=1
+            E=$((FIRST_ERR + 25))
+            echo "定位到第 ${FIRST_ERR} 行（日志共 $(wc -l < "$L") 行），输出 ${S}~${E}"
+            sed -n "${S},${E}p" "$L"
+          else
+            echo "未定位到失败点，见下方最后 120 行"
+          fi
           echo ""
           echo "############ 最后 120 行 ############"
           tail -120 "$L"
