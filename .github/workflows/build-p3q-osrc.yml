@@ -36,7 +36,7 @@ on:
           - llvm
           - hybrid
       force_localversion:
-        description: '强制 LOCALVERSION（如 -qgki-31050000）。留空 = 关掉 AUTO，保持 defconfig 里的 -qgki'
+        description: '强制 CONFIG_LOCALVERSION 完整值，形如 -qgki-30957850-abG9980ZHSGHZB1（取自 adb shell uname -r 去掉 5.4.274）。漏写 -qgki 会自动补上'
         required: false
         default: ''
       ksu_flavor:
@@ -49,7 +49,7 @@ on:
           - sukisu-v32
           - sukisu
       expected_release:
-        description: '原厂 kernel.release，形如 5.4.274-qgki-31050000（adb shell cat /proc/version 里 5.4.274 后面那段）。填了就强制校验'
+        description: '原厂 kernel.release 完整值，形如 5.4.274-qgki-30957850-abG9980ZHSGHZB1（= adb shell uname -r 的输出）。填了就强制校验'
         required: false
         default: ''
       bundle_modules:
@@ -497,14 +497,25 @@ jobs:
             echo "===== [1/3] defconfig ====="
             $M "$DEFCONFIG_TARGET"
             echo "===== [1.5/3] LOCALVERSION ====="
-            # defconfig 里是 CONFIG_LOCALVERSION="-qgki" + LOCALVERSION_AUTO=y。
-            # AUTO 在树里有 .git 时会追加 -g<hash>-dirty，得到 -qgki-gabab53f4-dirty；
-            # 原厂是 5.4.274-qgki-31050000。两者对不上，/vendor 里的 .ko 全部拒绝加载。
-            # 这里默认只关掉 AUTO（结果 = -qgki，可复现），需要完全对齐时用 force_localversion 指定。
+            # 原厂 vermagic = 5.4.274-qgki-30957850-abG9980ZHSGHZB1
+            #   -qgki 这一段来自 defconfig 的 CONFIG_LOCALVERSION
+            #   -30957850-abG9980ZHSGHZB1 是三星构建流水线注入的，源码树里查不到任何痕迹，
+            #   只能从设备 uname -r 读出来再手工对齐
+            # LOCALVERSION_AUTO 在有 .git 时会追加 -g<hash>-dirty，必须关掉
             sh ./scripts/config --file out/.config --disable LOCALVERSION_AUTO
             if [ -n "${FORCE_LOCALVERSION:-}" ]; then
-              sh ./scripts/config --file out/.config --set-str LOCALVERSION "$FORCE_LOCALVERSION"
-              echo "强制 LOCALVERSION=$FORCE_LOCALVERSION"
+              LV="$FORCE_LOCALVERSION"
+              # 容错：漏写 -qgki 前缀时自动补上，否则这一段会整个丢掉
+              case "$LV" in
+                -qgki*) : ;;
+                *) LV="-qgki${LV}"
+                   echo "::warning::输入值缺少 -qgki 前缀，已自动补成 $LV" ;;
+              esac
+              sh ./scripts/config --file out/.config --set-str LOCALVERSION "$LV"
+              echo "强制 CONFIG_LOCALVERSION=$LV"
+            else
+              echo "::warning::未指定 force_localversion，release 将是 5.4.274-qgki"
+              echo "::warning::与原厂不符时，/vendor/lib/modules 里的原厂 .ko 会拒绝加载"
             fi
             $M olddefconfig
             grep -E "^CONFIG_LOCALVERSION|LOCALVERSION_AUTO" out/.config || true
