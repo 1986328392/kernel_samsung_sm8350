@@ -521,7 +521,10 @@ jobs:
             #   -30957850-abG9980ZHSGHZB1 是三星构建流水线注入的，源码树里查不到任何痕迹，
             #   只能从设备 uname -r 读出来再手工对齐
             # LOCALVERSION_AUTO 在有 .git 时会追加 -g<hash>-dirty，必须关掉
-            sh ./scripts/config --file out/.config --disable LOCALVERSION_AUTO
+            # 注意：scripts/config 的 shebang 是 bash，而 Ubuntu 的 /bin/sh 是 dash，
+            # 必须用 bash 调用。用 sh 会在脚本第 179 行的 ${1//\"/\\\\\"} 上报
+            # "Bad substitution"（dash 不支持 ${var//a/b}）
+            bash ./scripts/config --file out/.config --disable LOCALVERSION_AUTO
             if [ -n "${FORCE_LOCALVERSION:-}" ]; then
               LV="$FORCE_LOCALVERSION"
               # 容错：漏写 -qgki 前缀时自动补上，否则这一段会整个丢掉
@@ -530,13 +533,17 @@ jobs:
                 *) LV="-qgki${LV}"
                    echo "::warning::输入值缺少 -qgki 前缀，已自动补成 $LV" ;;
               esac
-              sh ./scripts/config --file out/.config --set-str LOCALVERSION "$LV"
+              bash ./scripts/config --file out/.config --set-str LOCALVERSION "$LV"
               echo "强制 CONFIG_LOCALVERSION=$LV"
             else
               echo "::warning::未指定 force_localversion，release 将是 5.4.274-qgki"
               echo "::warning::与原厂不符时，/vendor/lib/modules 里的原厂 .ko 会拒绝加载"
             fi
+            # 写完立刻核对，别等到 olddefconfig 之后才发现没生效
+            grep -E '^CONFIG_LOCALVERSION=|^# CONFIG_LOCALVERSION_AUTO' out/.config \
+              || { echo "::error::LOCALVERSION 未写入 .config"; exit 1; }
             $M olddefconfig
+            echo "olddefconfig 之后:"
             grep -E "^CONFIG_LOCALVERSION|LOCALVERSION_AUTO" out/.config || true
             echo "===== [2/3] all（Image + dtb + dtbo.img）====="
             $M
