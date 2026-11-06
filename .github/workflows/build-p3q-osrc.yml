@@ -277,6 +277,27 @@ jobs:
         env:
           WANT: ${{ inputs.defconfig }}
 
+      # inspect_only=yes 时后面 8 个编译/打包步骤会被跳过，但整个 run 仍显示绿色成功，
+      # 很容易误以为"编译完成但没出包"。这里显式打一条结论，避免误会。
+      - name: Inspect-only summary
+        if: inputs.inspect_only == 'yes'
+        run: |
+          {
+            echo "## 本次只做探测，没有编译"
+            echo ""
+            echo "因为 \`inspect_only = yes\`，编译与打包步骤全部被跳过，**不会产生 AnyKernel3 卡刷包**。"
+            echo ""
+            echo "要出包：把 \`inspect_only\` 改成 \`no\` 重新 Run workflow。"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 内核树 | \`${KROOT}\` |"
+            echo "| defconfig | \`${DEFCONFIG}\` |"
+            echo "| make 目标 | \`${DEFCONFIG_TARGET}\` |"
+            echo "| 源包大小 | ${ASSET_SIZE:-未知} 字节 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Inspect only::本次只做探测，未编译，不会产生 AnyKernel3 包。把 inspect_only 改为 no 重新运行。"
+
       - name: Set up build environment
         run: |
           set -euo pipefail
