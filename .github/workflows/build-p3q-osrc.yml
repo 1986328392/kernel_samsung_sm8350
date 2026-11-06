@@ -524,27 +524,79 @@ jobs:
             # 注意不能用小写文件改名顶上：大写的是 iptables target，小写的是 match，
             # 两套 struct 完全不同，改名词会编译不过。
             # 从与源码同版本的 v5.4.274 稳定分支补回；下载失败则关掉对应 CONFIG 兜底。
-            OSRC_REF="https://raw.githubusercontent.com/gregkh/linux/v5.4.274/net/netfilter"
-            for f in xt_DSCP.c xt_TCPMSS.c xt_HL.c xt_RATEEST.c; do
-              [ -f "net/netfilter/$f" ] && { echo "已存在 net/netfilter/$f"; continue; }
-              if wget -q --timeout=60 --tries=3 "$OSRC_REF/$f" -O "net/netfilter/$f" \
-                 && [ -s "net/netfilter/$f" ] \
-                 && grep -q "MODULE_LICENSE" "net/netfilter/$f"; then
-                echo "已补齐 net/netfilter/$f（$(stat -c%s "net/netfilter/$f") bytes）"
-              else
-                rm -f "net/netfilter/$f"
-                case "$f" in
-                  xt_DSCP.c)    C=NETFILTER_XT_TARGET_DSCP ;;
-                  xt_TCPMSS.c)  C=NETFILTER_XT_TARGET_TCPMSS ;;
-                  xt_HL.c)      C=NETFILTER_XT_TARGET_HL ;;
-                  xt_RATEEST.c) C=NETFILTER_XT_TARGET_RATEEST ;;
-                esac
-                echo "::warning::补 $f 失败，关闭 CONFIG_${C} 兜底（该 iptables target 将不可用）"
-                bash ./scripts/config --file out/.config --disable "$C"
+            UPSTREAM="https://raw.githubusercontent.com/gregkh/linux/v5.4.274"
+            fetch_one() {   # $1=url  $2=dest
+              rm -f "$2"
+              if wget -q --timeout=60 --tries=3 -O "$2" "$1" && [ -s "$2" ]; then return 0; fi
+              if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+                      -o "$2" "$1" && [ -s "$2" ]; then return 0; fi
+              rm -f "$2"; return 1
+            }
+
+            # ---- (1)(2) 一次性补齐所有被折叠吃掉的文件（.c 与配套 uapi 头）----
+            # 名单是拿三星原始归档 Kernel.tar.gz 的条目清单，与解压结果逐条对比得出的，
+            # 全树只有这 9 个（另外 4 个 xt_CONNMARK.h / xt_MARK.h / ipt_ecn.h /
+            # 一个 litmus 测试文件：树里没有任何源码引用，且 xt_connmark.c/xt_mark.c
+            # 是三星自己合并过的单文件实现，补了反而会撞头文件保护宏，故不补）
+            RESTORE=$(printf '%s\n' \
+              "net/netfilter/xt_DSCP.c|NETFILTER_XT_TARGET_DSCP|c" \
+              "net/netfilter/xt_TCPMSS.c|NETFILTER_XT_TARGET_TCPMSS|c" \
+              "net/netfilter/xt_HL.c|NETFILTER_XT_TARGET_HL|c" \
+              "net/netfilter/xt_RATEEST.c|NETFILTER_XT_TARGET_RATEEST|c" \
+              "include/uapi/linux/netfilter/xt_DSCP.h|NETFILTER_XT_TARGET_DSCP|h" \
+              "include/uapi/linux/netfilter/xt_TCPMSS.h|NETFILTER_XT_TARGET_TCPMSS|h" \
+              "include/uapi/linux/netfilter/xt_RATEEST.h|NETFILTER_XT_TARGET_RATEEST|h" \
+              "include/uapi/linux/netfilter_ipv4/ipt_TTL.h|NETFILTER_XT_TARGET_HL|h" \
+              "include/uapi/linux/netfilter_ipv6/ip6t_HL.h|NETFILTER_XT_TARGET_HL|h")
+
+            # 精确大小写判断：不能用 [ -f ]，那在大小写不敏感的文件系统上会误判
+            exact_exists() { ls -1 "$(dirname "$1")" 2>/dev/null | grep -qxF "$(basename "$1")"; }
+
+            while IFS='|' read -r path cfg kind; do
+              [ -n "$path" ] || continue
+              if exact_exists "$path"; then
+                echo "已存在 $path"
+                continue
               fi
+              mkdir -p "$(dirname "$path")"
+              ok=0
+              if fetch_one "$UPSTREAM/$path" "$path"; then
+                if [ "$kind" = "c" ]; then
+                  if grep -q "MODULE_LICENSE" "$path"; then ok=1; fi
+                else
+                  if grep -qE "struct|#define" "$path"; then ok=1; fi
+                fi
+              fi
+              if [ "$ok" = "1" ]; then
+                echo "已补齐 $path（$(stat -c%s "$path") bytes）"
+              else
+                rm -f "$path"
+                echo "::warning::补 $path 失败，关闭 CONFIG_${cfg} 兜底（该功能将不可用）"
+                bash ./scripts/config --file out/.config --disable "$cfg"
+              fi
+            done <<< "$RESTORE"
+
+            # ---- (3) 校验补回来的 .c 所依赖的头文件是否齐全 ----
+            for f in net/netfilter/xt_DSCP.c net/netfilter/xt_TCPMSS.c \
+                     net/netfilter/xt_HL.c net/netfilter/xt_RATEEST.c; do
+              exact_exists "$f" || continue
+              grep -oE '^#[[:space:]]*include[[:space:]]*<[^>]+>' "$f" 2>/dev/null \
+                | sed -E 's/.*<([^>]+)>/\1/' | while read -r inc; do
+                  [ -z "$inc" ] && continue
+                  if [ -f "include/$inc" ] || [ -f "include/uapi/$inc" ] \
+                     || [ -f "arch/arm64/include/$inc" ] || [ -f "arch/arm64/include/uapi/$inc" ] \
+                     || [ -f "arch/arm64/include/generated/$inc" ]; then
+                    :
+                  else
+                    echo "::warning::$f 依赖的头文件缺失: $inc"
+                  fi
+                done
             done
-            echo "net/netfilter 现有 dscp/tcp 文件:"
-            ls -1 net/netfilter/ | grep -iE "dscp|tcpmss" || true
+            echo "---- 补齐结果核对 ----"
+            while IFS='|' read -r path cfg kind; do
+              [ -n "$path" ] || continue
+              if exact_exists "$path"; then echo "  OK   $path"; else echo "  MISS $path (CONFIG_${cfg} 已尝试关闭)"; fi
+            done <<< "$RESTORE"
 
             echo "===== [1.5/3] LOCALVERSION ====="
             # 原厂 vermagic = 5.4.274-qgki-30957850-abG9980ZHSGHZB1
